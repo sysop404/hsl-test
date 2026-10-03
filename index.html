@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Reittiopas Plus</title>
+  <meta name="description" content="HSL journey planner with adjustable transfer time, a day-long departure sweep, plan B, live vehicles and an arrival timer.">
+  <meta name="theme-color" content="#0b5fa5">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Reittiopas+">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Reittiopas<span>+</span></h1>
+    <button id="btn-settings" class="icon-btn" aria-label="Settings" title="Settings">⚙️</button>
+  </header>
+
+  <main class="layout">
+    <section class="panel">
+      <form id="search" class="search" autocomplete="off">
+        <div class="place-row">
+          <label class="place">
+            <span class="dot from"></span>
+            <input id="from" type="text" placeholder="From: address, stop or tap the map" aria-label="From">
+            <button type="button" class="mini" id="btn-locate" title="Use my location" aria-label="Use my location">◎</button>
+            <button type="button" class="mini star" data-for="from" title="Save place" aria-label="Save start as a place">☆</button>
+          </label>
+          <ul class="suggest" id="from-suggest" role="listbox"></ul>
+        </div>
+        <div class="place-row">
+          <label class="place">
+            <span class="dot to"></span>
+            <input id="to" type="text" placeholder="To" aria-label="To">
+            <button type="button" class="mini" id="btn-swap" title="Swap" aria-label="Swap start and destination">⇅</button>
+            <button type="button" class="mini star" data-for="to" title="Save place" aria-label="Save destination as a place">☆</button>
+          </label>
+          <ul class="suggest" id="to-suggest" role="listbox"></ul>
+        </div>
+        <div id="saved-places" class="chips"></div>
+
+        <div class="when">
+          <select id="when-mode" aria-label="When">
+            <option value="now">Leave now</option>
+            <option value="depart">Depart at</option>
+            <option value="arrive">Arrive by</option>
+          </select>
+          <input id="when-time" type="datetime-local" hidden aria-label="Time">
+        </div>
+
+        <div class="slack">
+          <span>Min transfer</span>
+          <button type="button" class="step" id="slack-minus" aria-label="Less transfer time">−</button>
+          <output id="slack-value">3 min</output>
+          <button type="button" class="step" id="slack-plus" aria-label="More transfer time">+</button>
+        </div>
+
+        <div class="actions">
+          <button type="submit" class="primary" id="btn-search">Search</button>
+          <button type="button" id="btn-sweep">Day sweep</button>
+        </div>
+      </form>
+
+      <nav class="tabs" role="tablist">
+        <button role="tab" data-tab="results" class="active">Routes</button>
+        <button role="tab" data-tab="sweep">Day sweep</button>
+        <button role="tab" data-tab="trip">Trip</button>
+      </nav>
+
+      <div id="message" class="message" hidden></div>
+
+      <section id="tab-results" class="tab active" aria-live="polite"></section>
+      <section id="tab-sweep" class="tab">
+        <div class="sweep-controls">
+          <label>Day <input type="date" id="sweep-date"></label>
+          <label>From <input type="number" id="sweep-from" min="0" max="23" step="1"></label>
+          <label>to <input type="number" id="sweep-to" min="1" max="28" step="1"></label>
+          <button type="button" id="btn-sweep-run" class="primary">Run</button>
+        </div>
+        <progress id="sweep-progress" max="1" value="0" hidden></progress>
+        <div id="sweep-out"><p class="hint">Pick a start and destination, then run the sweep to see how long the trip takes at each hour of the day.</p></div>
+      </section>
+      <section id="tab-trip" class="tab">
+        <div id="trip-out"><p class="hint">Open a route and press <b>Start trip</b> to get a live countdown for walking, waiting and riding.</p></div>
+      </section>
+    </section>
+
+    <div id="map" class="map" role="region" aria-label="Map"></div>
+  </main>
+
+  <dialog id="settings">
+    <form method="dialog" id="settings-form">
+      <h2>Settings</h2>
+      <p class="small">Saved in this browser only. On iPhone, add the page to your Home Screen so Safari doesn't clear it.</p>
+
+      <fieldset>
+        <legend>Digitransit API key</legend>
+        <input id="set-key" type="password" placeholder="Paste your subscription key" autocomplete="off" spellcheck="false">
+        <p class="small">Get a free key at <a href="https://portal-api.digitransit.fi/" target="_blank" rel="noopener">portal-api.digitransit.fi</a>: sign up, subscribe to the developer product with the Routing and Geocoding APIs, and copy the key from your Profile. Type <code>demo</code> to try the app with made-up data.</p>
+        <label class="inline"><input type="checkbox" id="set-key-show"> Show key</label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Routing</legend>
+        <label>Minimum transfer time (min) <input id="set-slack" type="number" min="0" max="30" step="1"></label>
+        <label>Walking speed (km/h) <input id="set-walk" type="number" min="2" max="10" step="0.5"></label>
+        <label>Max transfers <select id="set-maxtr">
+          <option value="">Any</option><option>0</option><option>1</option><option>2</option><option>3</option>
+        </select></label>
+        <label class="inline"><input type="checkbox" id="set-wheelchair"> Wheelchair accessible only</label>
+        <div class="modes" id="set-modes"></div>
+        <label>Avoid lines <input id="set-avoid" type="text" placeholder="e.g. 550, 200"></label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Saved places</legend>
+        <ul id="set-places" class="places"></ul>
+      </fieldset>
+
+      <fieldset>
+        <legend>Move settings to another device</legend>
+        <button type="button" id="btn-export">Copy settings link</button>
+        <p class="small">The link carries everything except your API key.</p>
+      </fieldset>
+
+      <div class="dialog-actions">
+        <button type="button" id="btn-clear" class="danger">Clear all data</button>
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button value="save" class="primary" id="btn-save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script src="vendor/mqtt.min.js"></script>
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>
