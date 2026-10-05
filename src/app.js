@@ -1241,6 +1241,7 @@ function init() {
     $('#msg-settings').addEventListener('click', openSettings);
   }
   window.addEventListener('resize', () => map.invalidate());
+  globalThis.__rpBooted = true; // checked by index.html
 }
 
 init();

@@ -175,5 +175,16 @@
   <script src="vendor/leaflet/leaflet.js"></script>
   <script src="vendor/mqtt.min.js"></script>
   <script type="module" src="src/app.js"></script>
+  <script>
+    // If the app didn't start (for example a stale copy of a script from before an update, or an
+    // error), say so instead of leaving buttons that silently do nothing.
+    window.addEventListener('load', () => {
+      if (window.__rpBooted) return;
+      const m = document.getElementById('message');
+      m.hidden = false;
+      m.className = 'message error';
+      m.innerHTML = 'The app didn\'t finish loading. This usually means the browser kept part of an older version after an update. <button type="button" onclick="location.reload()">Reload</button>';
+    });
+  </script>
 </body>
 </html>

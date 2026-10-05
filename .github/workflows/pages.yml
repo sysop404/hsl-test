@@ -35,6 +35,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+      # Give every script and stylesheet a per-deploy URL, so a browser can never mix files from
+      # an old deploy (still in its cache) with a new page.
+      - name: Version asset URLs
+        run: |
+          v="${GITHUB_SHA::8}"
+          sed -i -E "s#(src|href)=\"(src/app\.js|app\.css)\"#\1=\"\2?v=$v\"#" index.html
+          sed -i -E "s#(from '\./[A-Za-z0-9_-]+\.js)'#\1?v=$v'#g" src/*.js
+          grep -q "app.js?v=$v" index.html
       - uses: actions/upload-pages-artifact@v3
         with:
           path: .
