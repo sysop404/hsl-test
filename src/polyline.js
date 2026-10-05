@@ -42,6 +42,13 @@ export function encodePolyline(points, precision = 5) {
   return out;
 }
 
+/** One polyline from several (legs of a walk). */
+export function joinPolylines(list) {
+  const nonEmpty = list.filter(Boolean);
+  if (nonEmpty.length < 2) return nonEmpty[0] ?? '';
+  return encodePolyline(nonEmpty.flatMap((p) => decodePolyline(p)));
+}
+
 function encodeValue(v) {
   let n = v < 0 ? ~(v << 1) : v << 1;
   let s = '';

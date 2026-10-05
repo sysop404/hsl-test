@@ -3,6 +3,7 @@
 import { decodePolyline } from './polyline.js';
 
 const MODE_COLORS = { BUS: '#007ac9', TRAM: '#00985f', SUBWAY: '#ff6319', RAIL: '#8c4799', FERRY: '#00b9e4', WALK: '#8a94a3' };
+const EXERCISE_COLOR = '#c2255c';
 
 export function modeColor(mode) {
   return MODE_COLORS[mode] ?? MODE_COLORS.BUS;
@@ -15,6 +16,7 @@ export function createMap(el, { onPick }) {
   const routeLayer = L.layerGroup().addTo(map);
   const pinLayer = L.layerGroup().addTo(map);
   const vehicles = new Map();
+  let me = null; // { dot, ring } for the user's GPS position
 
   function setTiles(apiKey) {
     if (tiles) map.removeLayer(tiles);
@@ -68,6 +70,13 @@ export function createMap(el, { onPick }) {
       for (const leg of it.legs) {
         const pts = leg.points ? decodePolyline(leg.points) : [[leg.from.lat, leg.from.lon], [leg.to.lat, leg.to.lon]];
         all.push(...pts);
+        if (leg.exercise) {
+          L.polyline(pts, { color: EXERCISE_COLOR, weight: 7, dashArray: '1 11', lineCap: 'round', opacity: 0.95 }).addTo(routeLayer);
+          const stop = leg.to.stopId ? leg.to : leg.from;
+          L.circleMarker([stop.lat, stop.lon], { radius: 7, color: '#fff', weight: 2, fillColor: EXERCISE_COLOR, fillOpacity: 1 })
+            .bindTooltip(`🏃 ${leg.to.stopId ? 'Walk to' : 'Get off at'} ${stop.name}`, { permanent: false }).addTo(routeLayer);
+          continue;
+        }
         L.polyline(pts, {
           color: leg.route?.color ?? modeColor(leg.mode),
           weight: leg.transit ? 6 : 4,
@@ -91,6 +100,23 @@ export function createMap(el, { onPick }) {
         m.setLatLng([v.lat, v.lon]);
       }
       return m;
+    },
+    /** Your GPS position with its accuracy circle, or null to hide it. */
+    setMe(fix) {
+      if (!fix) {
+        if (me) { map.removeLayer(me.dot); map.removeLayer(me.ring); me = null; }
+        return;
+      }
+      const at = [fix.lat, fix.lon];
+      if (!me) {
+        me = {
+          ring: L.circle(at, { radius: fix.accuracy, weight: 0, fillColor: '#1a73e8', fillOpacity: 0.15, interactive: false }).addTo(map),
+          dot: L.circleMarker(at, { radius: 6, color: '#fff', weight: 2, fillColor: '#1a73e8', fillOpacity: 1, interactive: false }).addTo(map),
+        };
+      } else {
+        me.ring.setLatLng(at).setRadius(fix.accuracy);
+        me.dot.setLatLng(at);
+      }
     },
     clearVehicles() {
       for (const m of vehicles.values()) map.removeLayer(m);

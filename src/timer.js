@@ -98,3 +98,62 @@ export function withLegs(itinerary, legs) {
   }
   return { ...itinerary, legs: fixed, start: fixed[0].start, end: fixed[fixed.length - 1].end, duration: Math.round((fixed[fixed.length - 1].end - fixed[0].start) / 1000) };
 }
+
+/**
+ * The trip as it stands now: the itinerary as started (base) with live transit legs applied
+ * (updated: Map legIndex -> leg). Walks after a vehicle move with it. The walk from the origin keeps
+ * its planned leave time when the first vehicle is late (the delay becomes spare time at the stop),
+ * but moves earlier when the vehicle is early, so the countdown never makes you miss it.
+ */
+export function liveItinerary(base, updated) {
+  const it = withLegs(base, base.legs.map((l, i) => updated.get(i) ?? l));
+  const first = it.legs.findIndex((l) => l.transit);
+  if (first > 0) {
+    const early = it.legs[first - 1].end - it.legs[first].start;
+    if (early > 0) {
+      for (let i = 0; i < first; i++) {
+        it.legs[i] = { ...it.legs[i], start: it.legs[i].start - early, end: it.legs[i].end - early };
+      }
+      it.start = it.legs[0].start;
+      it.duration = Math.round((it.end - it.start) / 1000);
+    }
+  }
+  return it;
+}
+
+/**
+ * What changed since the trip was started, for the banner.
+ *   late / early: an upcoming departure moved by a minute or more (deltaSec vs the plan you started
+ *                 with, delaySec vs the timetable). first = it's the first vehicle, so for 'early'
+ *                 the leave time moved too (leaveWas -> leaveNow).
+ *   tight / missed: a transfer now has less than slackSec, or less than nothing.
+ *   arrival: the arrival time moved by a minute or more.
+ */
+export function tripNotices(base, live, now, slackSec) {
+  const out = [];
+  const firstTransit = live.legs.findIndex((l) => l.transit);
+  live.legs.forEach((l, i) => {
+    if (!l.transit || l.start <= now) return;
+    const delta = l.start - base.legs[i].start;
+    if (Math.abs(delta) < 60_000) return;
+    out.push({
+      kind: delta > 0 ? 'late' : 'early',
+      legIndex: i,
+      first: i === firstTransit,
+      deltaSec: Math.round(delta / 1000),
+      delaySec: Math.round((l.start - l.startScheduled) / 1000),
+      was: base.legs[i].start,
+      now: l.start,
+      leaveWas: base.legs[0].start,
+      leaveNow: live.legs[0].start,
+    });
+  });
+  for (const g of transferGaps(live)) {
+    if (live.legs[g.toLeg].start <= now || g.seconds >= slackSec) continue;
+    out.push({ kind: g.seconds < 0 ? 'missed' : 'tight', fromLeg: g.fromLeg, toLeg: g.toLeg, at: g.at, seconds: g.seconds });
+  }
+  if (Math.abs(live.end - base.end) >= 60_000) {
+    out.push({ kind: 'arrival', was: base.end, now: live.end, deltaSec: Math.round((live.end - base.end) / 1000) });
+  }
+  return out;
+}

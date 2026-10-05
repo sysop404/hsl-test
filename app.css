@@ -15,6 +15,7 @@
   --rail: #8c4799;
   --ferry: #00b9e4;
   --walk: #8a94a3;
+  --exercise: #c2255c;
   --radius: 10px;
   color-scheme: light dark;
 }
@@ -27,6 +28,7 @@
     --line: #2a3440;
     --accent: #4aa3ff;
     --accent-ink: #06121f;
+    --exercise: #f06595;
   }
 }
 
@@ -123,6 +125,26 @@ body.compact .tabs { margin-top: 0; }
 .hint, .small { color: var(--muted); }
 .small { font-size: 13px; }
 
+.shift { display: flex; gap: 6px; flex-wrap: wrap; }
+.shift button { flex: 1; padding: 5px 6px; font-size: 13px; border-radius: 999px; }
+
+.exercise { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 10px; }
+.ex-head { display: flex; align-items: center; gap: 10px; justify-content: space-between; }
+.ex-head label { display: flex; align-items: center; gap: 6px; font-weight: 600; white-space: nowrap; }
+.ex-head .small { text-align: right; }
+.ex-opts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+.ex-opts[hidden] { display: none; }
+.ex-opts label { display: grid; gap: 2px; font-size: 13px; color: var(--muted); }
+.ex-opts label.inline { display: flex; align-items: center; gap: 6px; }
+.ex-opts .wide { grid-column: 1 / -1; }
+.ex-opts p { margin: 0; }
+.ex-box { margin: 4px 0 8px; padding: 8px 10px; border-left: 3px solid var(--exercise); background: color-mix(in srgb, var(--exercise) 8%, transparent); border-radius: 4px; font-size: 14px; display: grid; gap: 6px; }
+.ex-box .chips button.on { border-color: var(--exercise); box-shadow: inset 0 0 0 1px var(--exercise); }
+.ex-tag { color: var(--exercise); font-weight: 600; }
+.leg .what.ex { color: var(--exercise); font-weight: 600; }
+
+.page-btn { width: 100%; margin: 6px 0; color: var(--accent); }
+
 /* Itinerary cards */
 .itin { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); margin: 8px 0; }
 .itin > summary { list-style: none; cursor: pointer; padding: 10px 12px; display: grid; gap: 6px; }
@@ -187,6 +209,16 @@ table.sweep tr { cursor: pointer; }
 .trip-legs li.done { opacity: .5; }
 .trip-legs li.now { border-left-color: var(--accent); font-weight: 600; }
 .live-note { font-size: 13px; color: var(--muted); }
+.notices { display: grid; gap: 6px; margin-bottom: 8px; }
+.notice { padding: 8px 10px; border-radius: var(--radius); border-left: 4px solid var(--warn); background: color-mix(in srgb, var(--warn) 12%, var(--panel)); text-align: left; }
+.notice.bad { border-left-color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, var(--panel)); }
+.notice.good { border-left-color: var(--good); background: color-mix(in srgb, var(--good) 10%, var(--panel)); }
+.notice.flash { animation: flash 1s ease-in-out 3; }
+@keyframes flash { 50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--bad) 45%, transparent); } }
+@media (prefers-reduced-motion: reduce) { .notice.flash { animation: none; } }
+.trip-legs s, .timer s { color: var(--muted); font-weight: 400; }
+.pace { font-size: 14px; }
+.row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
 /* Map vehicles */
 .veh { width: 26px; height: 26px; border-radius: 50%; border: 2px solid #fff; color: #fff; font: 700 11px/22px system-ui, sans-serif; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,.4); }
