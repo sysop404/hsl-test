@@ -5,13 +5,15 @@ import { MODES } from './settings.js';
 
 export const PLAN_QUERY = `
 query Plan($origin: PlanLabeledLocationInput!, $destination: PlanLabeledLocationInput!,
-           $dateTime: PlanDateTimeInput, $searchWindow: Duration, $first: Int,
+           $dateTime: PlanDateTimeInput, $searchWindow: Duration, $first: Int, $last: Int,
+           $after: String, $before: String,
            $modes: PlanModesInput, $preferences: PlanPreferencesInput) {
   planConnection(origin: $origin, destination: $destination, dateTime: $dateTime,
-                 searchWindow: $searchWindow, first: $first, modes: $modes, preferences: $preferences) {
+                 searchWindow: $searchWindow, first: $first, last: $last, after: $after, before: $before,
+                 modes: $modes, preferences: $preferences) {
     searchDateTime
     routingErrors { code description }
-    pageInfo { searchWindowUsed }
+    pageInfo { searchWindowUsed startCursor endCursor hasPreviousPage hasNextPage }
     edges { node {
       start end duration numberOfTransfers walkDistance waitingTime
       legs {
@@ -24,10 +26,28 @@ query Plan($origin: PlanLabeledLocationInput!, $destination: PlanLabeledLocation
         trip { gtfsId directionId tripHeadsign departureStoptime { scheduledDeparture } }
         legGeometry { points }
         alerts { alertHeaderText }
+        intermediatePlaces {
+          name lat lon
+          arrival { scheduledTime estimated { time } }
+          departure { scheduledTime estimated { time } }
+          stop { gtfsId code platformCode }
+        }
       }
     } }
   }
 }`;
+
+/** Walking-only routes for several origin/destination pairs in one request (aliases w0, w1, ...). */
+export function walkQuery(n) {
+  const params = [];
+  const fields = [];
+  for (let i = 0; i < n; i++) {
+    params.push(`$o${i}: PlanLabeledLocationInput!, $d${i}: PlanLabeledLocationInput!`);
+    fields.push(`w${i}: planConnection(origin: $o${i}, destination: $d${i}, first: 1, preferences: $p,
+      modes: { directOnly: true, direct: [WALK] }) { edges { node { duration legs { distance duration legGeometry { points } } } } }`);
+  }
+  return `query Walks(${params.join(', ')}, $p: PlanPreferencesInput) {\n  ${fields.join('\n  ')}\n}`;
+}
 
 export const ROUTES_QUERY = `
 query Routes($name: String) { routes(name: $name, feeds: ["HSL"]) { gtfsId shortName } }`;
@@ -50,7 +70,8 @@ export function toLocation(place) {
 
 /**
  * Variables for PLAN_QUERY.
- * opts: { from, to, time (ms), arriveBy, searchWindowMin, first, avoidRouteIds }
+ * opts: { from, to, time (ms), arriveBy, searchWindowMin, first, avoidRouteIds,
+ *         after / before (page cursors from an earlier search) }
  */
 export function buildPlanVariables(settings, opts) {
   const transfer = { slack: isoMinutes(settings.transferSlackMin) };
@@ -69,13 +90,20 @@ export function buildPlanVariables(settings, opts) {
     origin: toLocation(opts.from),
     destination: toLocation(opts.to),
     preferences,
-    first: opts.first ?? 6,
   };
+  if (opts.before) {
+    vars.before = opts.before;
+    vars.last = opts.first ?? 6;
+  } else {
+    vars.first = opts.first ?? 6;
+    if (opts.after) vars.after = opts.after;
+  }
   if (opts.time !== undefined) {
     const t = toOffsetDateTime(opts.time);
     vars.dateTime = opts.arriveBy ? { latestArrival: t } : { earliestDeparture: t };
   }
-  if (opts.searchWindowMin) vars.searchWindow = isoMinutes(opts.searchWindowMin);
+  // A cursor already carries its search window.
+  if (opts.searchWindowMin && !opts.after && !opts.before) vars.searchWindow = isoMinutes(opts.searchWindowMin);
   const modes = settings.modes.filter((m) => MODES.includes(m));
   if (modes.length && modes.length < MODES.length) {
     vars.modes = { transit: { transit: modes.map((mode) => ({ mode })) } };
@@ -124,6 +152,14 @@ export function normalizeLeg(l) {
     interlined: !!l.interlineWithPreviousLeg,
     points: l.legGeometry?.points ?? '',
     alerts: (l.alerts ?? []).map((a) => a.alertHeaderText).filter(Boolean),
+    // Stops passed on board, in order (transit legs only).
+    stops: (l.intermediatePlaces ?? []).filter((p) => p?.stop).map((p) => ({
+      ...place(p),
+      arr: timeOf(p.arrival ?? p.departure),
+      dep: timeOf(p.departure ?? p.arrival),
+      arrScheduled: Date.parse((p.arrival ?? p.departure).scheduledTime),
+      depScheduled: Date.parse((p.departure ?? p.arrival).scheduledTime),
+    })),
   };
 }
 
@@ -149,10 +185,11 @@ export function itineraryKey(legs, start) {
 
 export function normalizePlanResponse(data) {
   const pc = data?.planConnection;
-  if (!pc) return { itineraries: [], errors: [] };
+  if (!pc) return { itineraries: [], errors: [], pageInfo: {} };
   return {
     itineraries: (pc.edges ?? []).map((e) => normalizeItinerary(e.node)),
     errors: pc.routingErrors ?? [],
+    pageInfo: pc.pageInfo ?? {},
   };
 }
 

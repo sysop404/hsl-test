@@ -7,8 +7,11 @@ import { createLiveTracker } from './live.js';
 import { planB } from './planb.js';
 import { transferGaps } from './plan.js';
 import { runSweep } from './sweep.js';
-import { applyLiveTimes, tripPhase, withLegs } from './timer.js';
-import { MODES, exportSettings, importSettings, loadSettings, saveSettings } from './settings.js';
+import { applyLiveTimes, liveItinerary, tripNotices, tripPhase } from './timer.js';
+import { MODES, exportSettings, importSettings, loadSettings, sanitize, saveSettings } from './settings.js';
+import { buildExercise, planExercise, walkingKcal } from './exercise.js';
+import { createPaceTracker, learnedKmh, loadPace, pacePrior, recordPace, resetPace, savePace } from './pace.js';
+import { haversine } from './geo.js';
 import { fmtCountdown, fmtDuration, helsinkiDate, helsinkiParts, helsinkiToMs, hhmm } from './time.js';
 
 const $ = (sel) => document.querySelector(sel);
@@ -25,6 +28,10 @@ const state = {
   trip: null,
   vehicles: new Map(), // legIndex -> latest vehicle info for the displayed itinerary
   displayedLegs: [],
+  drawnKey: null, // itinerary currently on the map (to fit the view only when it changes)
+  page: { startCursor: null, endCursor: null }, // routing API cursors for earlier / later
+  paging: false,
+  pace: loadPace(), // learned walking speeds
 };
 
 const isDemo = () => state.settings.apiKey.toLowerCase() === 'demo';
@@ -170,7 +177,9 @@ function queryTime() {
   return { time: helsinkiToMs(d, h, m), arriveBy: mode === 'arrive' };
 }
 
-async function search({ append = false } = {}) {
+const sortItins = (list) => list.slice().sort((a, b) => a.start - b.start || a.end - b.end);
+
+async function search({ page } = {}) {
   if (!state.from || !state.to) {
     showMessage('Choose a start and a destination first. You can also tap the map.');
     return;
@@ -180,31 +189,279 @@ async function search({ append = false } = {}) {
   const btn = $('#btn-search');
   btn.disabled = true;
   try {
-    let q;
-    if (append && state.lastQuery && state.itineraries.length) {
-      const last = state.itineraries[state.itineraries.length - 1];
-      q = { ...state.lastQuery, time: last.start + 60_000, arriveBy: false };
+    if (page && state.lastQuery && state.itineraries.length) {
+      await loadPage(page);
     } else {
-      q = { from: state.from, to: state.to, first: 6, ...queryTime() };
+      const q = { from: state.from, to: state.to, first: 6, ...queryTime() };
+      $('#tab-results').innerHTML = '<p class="hint">Searching…</p>';
+      const res = await api.plan(state.settings, q);
+      state.lastQuery = q;
+      state.page = { startCursor: res.pageInfo.startCursor ?? null, endCursor: res.pageInfo.endCursor ?? null };
+      state.itineraries = sortItins(res.itineraries);
+      state.openIndex = state.itineraries.length ? 0 : -1;
+      renderResults();
+      if (!state.itineraries.length) {
+        const why = res.errors.map((e) => e.description).join(' ');
+        showMessage(`No routes found. ${esc(why)}`);
+      }
     }
-    if (!append) $('#tab-results').innerHTML = '<p class="hint">Searching…</p>';
-    const res = await api.plan(state.settings, q);
-    state.lastQuery = q;
-    const seen = new Set(append ? state.itineraries.map((i) => i.key) : []);
-    const fresh = res.itineraries.filter((i) => !seen.has(i.key));
-    state.itineraries = append ? [...state.itineraries, ...fresh] : res.itineraries;
-    if (!append) state.openIndex = state.itineraries.length ? 0 : -1;
-    renderResults();
-    if (!state.itineraries.length) {
-      const why = res.errors.map((e) => e.description).join(' ');
-      showMessage(`No routes found. ${esc(why)}`);
-    }
+    runExercise();
   } catch (e) {
     handleError(e);
-    if (!append) $('#tab-results').innerHTML = '';
+    if (!page) $('#tab-results').innerHTML = '';
   } finally {
     btn.disabled = false;
   }
+}
+
+/**
+ * Earlier or later routes for the last search, added to the list. Uses the routing API's page
+ * cursors; if there's no cursor or the page brings nothing new, searches again from a shifted time.
+ * With "arrive by", the API's forward direction goes to earlier arrivals.
+ */
+async function loadPage(page) {
+  if (state.paging) return;
+  state.paging = true;
+  renderPagingButtons();
+  try {
+    const q0 = state.lastQuery;
+    const its = state.itineraries;
+    const seen = new Set(its.map((i) => i.key));
+    const forward = (page === 'later') !== !!q0.arriveBy;
+    const cursor = forward ? state.page.endCursor : state.page.startCursor;
+    let fresh = [];
+    if (cursor) {
+      try {
+        const res = await api.plan(state.settings, { ...q0, after: forward ? cursor : undefined, before: forward ? undefined : cursor });
+        fresh = res.itineraries.filter((i) => !seen.has(i.key));
+        if (forward) state.page.endCursor = res.pageInfo.endCursor ?? null;
+        else state.page.startCursor = res.pageInfo.startCursor ?? null;
+      } catch (e) {
+        if (e.status === 401 || e.status === 403 || e.status === 0) throw e;
+        console.warn('paging failed, searching by time instead', e);
+      }
+    }
+    if (!fresh.length) {
+      const minStart = Math.min(...its.map((i) => i.start));
+      const maxStart = Math.max(...its.map((i) => i.start));
+      const minEnd = Math.min(...its.map((i) => i.end));
+      const maxEnd = Math.max(...its.map((i) => i.end));
+      let q;
+      let keep;
+      if (!q0.arriveBy) {
+        q = page === 'later' ? { ...q0, time: maxStart + 60_000 } : { ...q0, time: minStart - 45 * 60_000 };
+        keep = page === 'later' ? () => true : (i) => i.start < minStart;
+      } else {
+        q = page === 'earlier' ? { ...q0, time: minEnd - 60_000 } : { ...q0, time: maxEnd + 45 * 60_000 };
+        keep = page === 'earlier' ? () => true : (i) => i.end > maxEnd;
+      }
+      const res = await api.plan(state.settings, q);
+      fresh = res.itineraries.filter((i) => !seen.has(i.key) && keep(i));
+    }
+    if (!fresh.length) {
+      showMessage(`No ${page} routes found.`);
+      return;
+    }
+    const openKey = state.itineraries[state.openIndex]?.key;
+    state.itineraries = sortItins([...its, ...fresh]);
+    state.openIndex = state.itineraries.findIndex((i) => i.key === openKey);
+    renderResults();
+    const cards = [...document.querySelectorAll('#tab-results details.itin')];
+    const firstNew = cards.find((c) => fresh.some((f) => f.key === state.itineraries[+c.dataset.i].key));
+    firstNew?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  } finally {
+    state.paging = false;
+    renderPagingButtons();
+  }
+}
+
+function renderPagingButtons() {
+  for (const [id, label] of [['#btn-earlier', '▲ Earlier routes'], ['#btn-later', '▼ Later routes']]) {
+    const b = $(id);
+    if (!b) continue;
+    b.disabled = state.paging;
+    b.textContent = state.paging ? 'Loading…' : label;
+  }
+}
+
+/** Search again from a time shifted by `min` minutes (from now when the mode is "Leave now"). */
+function shiftTime(min) {
+  const mode = $('#when-mode');
+  let base;
+  if (mode.value === 'now') {
+    mode.value = 'depart';
+    $('#when-time').hidden = false;
+    base = Date.now();
+  } else {
+    base = queryTime().time;
+  }
+  $('#when-time').value = localInputValue(base + min * 60_000);
+  if (state.from && state.to) search();
+}
+
+// ---------- exercise ----------
+
+const ex = {
+  sig: '', // where|min|max the plans below were made for
+  plans: new Map(), // base itinerary key -> planExercise() result, or { status: 'pending' | 'error' }
+  choice: new Map(), // base itinerary key -> option key the user picked
+  built: new Map(), // memoized exercise itineraries
+  walks: new Map(), // "lat,lon>lat,lon" -> walking route
+  run: 0,
+};
+
+const exSig = () => { const e = state.settings.exercise; return `${e.where}|${e.minM}|${e.maxM}`; };
+const optKey = (o) => o.stop.place.stopId ?? `${o.stop.place.lat},${o.stop.place.lon}`;
+const exOptions = (r) => [...(r.options ?? []), r.shorter, r.longer].filter(Boolean);
+const body = () => ({ weightKg: state.settings.weightKg, heightCm: state.settings.heightCm });
+
+/** Exercise walking speed: the measured one when asked for and there are 3+ walks, else the setting. */
+function exerciseSpeed() {
+  const e = state.settings.exercise;
+  const measured = learnedKmh(state.pace.exercise, 3);
+  return e.useMeasured && measured ? +measured.toFixed(1) : e.speedKmh;
+}
+
+async function cachedWalks(pairs) {
+  const key = (p) => `${p.from.lat.toFixed(5)},${p.from.lon.toFixed(5)}>${p.to.lat.toFixed(5)},${p.to.lon.toFixed(5)}`;
+  const missing = [...new Map(pairs.filter((p) => !ex.walks.has(key(p))).map((p) => [key(p), p])).values()];
+  if (missing.length) {
+    const res = await api.walks(missing, exerciseSpeed());
+    missing.forEach((p, i) => ex.walks.set(key(p), res[i]));
+  }
+  return pairs.map((p) => ex.walks.get(key(p)));
+}
+
+/** Finds leave-off points for every listed route that doesn't have one yet, one route at a time. */
+async function runExercise() {
+  if (!state.settings.exercise.enabled || !state.itineraries.length) return;
+  const sig = exSig();
+  if (sig !== ex.sig) {
+    ex.plans.clear();
+    ex.choice.clear();
+    ex.built.clear();
+    ex.sig = sig;
+  }
+  const run = ++ex.run;
+  const { where, minM, maxM } = state.settings.exercise;
+  for (const it of state.itineraries) {
+    if (ex.plans.has(it.key)) continue;
+    ex.plans.set(it.key, { status: 'pending' });
+    let r;
+    try {
+      r = await planExercise({ it, where, minM, maxM, walks: cachedWalks });
+    } catch (e) {
+      r = { status: 'error', message: e.message };
+    }
+    if (ex.sig !== sig) return;
+    ex.plans.set(it.key, r);
+    if (run !== ex.run) return;
+    renderResults();
+  }
+}
+
+/** The itinerary as it should be shown: with the exercise walk when exercise mode has one for it. */
+function shown(it) {
+  if (!state.settings.exercise.enabled) return it;
+  const r = ex.plans.get(it.key);
+  if (!r || (r.status !== 'ok' && r.status !== 'none')) return it;
+  const pick = ex.choice.get(it.key);
+  const opt = pick ? exOptions(r).find((o) => optKey(o) === pick) : r.chosen;
+  if (!opt) return it;
+  const speed = exerciseSpeed();
+  const k = `${it.key}|${optKey(opt)}|${speed}|${state.settings.weightKg}|${state.settings.heightCm}`;
+  if (!ex.built.has(k)) ex.built.set(k, buildExercise(it, r, opt, speed, body()));
+  return ex.built.get(k);
+}
+
+function kcalText(kcal) {
+  if (!kcal) return '<span class="small">add weight and height in Settings to see calories</span>';
+  return `≈ ${Math.round(kcal.total)} kcal <span class="small">(${Math.round(kcal.active)} for the walking itself)</span>`;
+}
+
+function exerciseBox(base, it, index) {
+  const e = state.settings.exercise;
+  if (!e.enabled) return '';
+  const r = ex.plans.get(base.key);
+  if (!r || r.status === 'pending') return '<div class="ex-box small">🏃 Finding a leave-off point…</div>';
+  if (r.status === 'na') return '<div class="ex-box small">🏃 This route is walking only, so there is no vehicle to leave early.</div>';
+  if (r.status === 'error') return `<div class="ex-box small">🏃 Could not plan the exercise walk: ${esc(r.message)}</div>`;
+  const vehicle = badge(base.legs[r.legIndex]);
+  const x = it.exercise;
+  const used = x ? (ex.choice.get(base.key) ?? (r.chosen && optKey(r.chosen))) : null;
+  const chip = (o, note) => `<button type="button" class="chip ${optKey(o) === used ? 'on' : ''}" data-ex="${index}" data-opt="${esc(optKey(o))}">${esc(o.stop.place.name)} · ${km(o.distance)}${note ? ` (${note})` : ''}</button>`;
+  const parts = [];
+  if (r.status === 'none') {
+    const closest = [r.shorter && chip(r.shorter, 'shorter'), r.longer && chip(r.longer, 'longer')].filter(Boolean);
+    parts.push(`<div>⚠️ No stop on ${vehicle} gives a walk of ${km(e.minM)}–${km(e.maxM)}.${closest.length ? ' Closest:' : ''}</div>`);
+    if (closest.length) parts.push(`<div class="chips">${closest.join('')}</div>`);
+    if (!x) parts.push('<div class="small">Showing the route without exercise. Pick one of the stops above to use it.</div>');
+  }
+  if (x) {
+    const what = x.where === 'last'
+      ? `Get off ${vehicle} at <b>${esc(x.stopName)}</b> and walk <b>${km(x.distance)}</b> to the destination`
+      : `Walk <b>${km(x.distance)}</b> to <b>${esc(x.stopName)}</b> and get on ${vehicle} there`;
+    const extra = Math.round(x.extraSec / 60);
+    const cost = x.where === 'last'
+      ? (extra > 0 ? `arrives ${extra} min later than riding all the way` : 'arrives no later than riding all the way')
+      : (extra > 0 ? `leave ${extra} min earlier, same vehicle, same arrival` : 'same vehicle, same arrival');
+    parts.push(`<div>🏃 ${what} (${fmtDuration(x.durationSec)} at ${x.speedKmh.toFixed(1)} km/h).</div>`);
+    parts.push(`<div class="small">${kcalText(x.kcal)} · ${cost}</div>`);
+  }
+  if (r.status === 'ok' && r.options.length > 1) {
+    parts.push(`<div class="small">Other stops in range:</div><div class="chips">${r.options.map((o) => chip(o)).join('')}</div>`);
+  }
+  return `<div class="ex-box">${parts.join('')}</div>`;
+}
+
+function renderExerciseForm() {
+  const e = state.settings.exercise;
+  $('#ex-on').checked = e.enabled;
+  $('#ex-opts').hidden = !e.enabled;
+  $('#ex-where').value = e.where;
+  $('#ex-min').value = e.minM;
+  $('#ex-max').value = e.maxM;
+  $('#ex-speed').value = e.speedKmh;
+  $('#ex-measured').checked = e.useMeasured;
+  const n = state.pace.exercise.n;
+  const measured = learnedKmh(state.pace.exercise, 3);
+  $('#ex-measured-label').textContent = measured
+    ? `Use my measured exercise pace (${measured.toFixed(1)} km/h from ${n} walks)`
+    : `Use my measured exercise pace once known (${n} of 3 walks recorded)`;
+  $('#ex-speed').disabled = !!(e.useMeasured && measured);
+  $('#ex-summary').textContent = e.enabled
+    ? `${e.where === 'last' ? 'near destination' : 'from start'} · ${km(e.minM)}–${km(e.maxM)} · ${exerciseSpeed().toFixed(1)} km/h`
+    : '';
+}
+
+function onExerciseChange(e) {
+  // Moving one end of the range past the other drags the other along.
+  let minM = +$('#ex-min').value;
+  let maxM = +$('#ex-max').value;
+  if (minM > maxM) {
+    if (e?.target?.id === 'ex-max') minM = maxM;
+    else maxM = minM;
+  }
+  const before = JSON.stringify(state.settings.exercise);
+  state.settings = sanitize({
+    ...state.settings,
+    exercise: {
+      enabled: $('#ex-on').checked,
+      where: $('#ex-where').value,
+      minM,
+      maxM,
+      speedKmh: $('#ex-speed').value,
+      useMeasured: $('#ex-measured').checked,
+    },
+  });
+  renderExerciseForm();
+  // A blur can fire "change" with nothing changed; re-rendering then would swallow the user's click.
+  if (JSON.stringify(state.settings.exercise) === before) return;
+  persist();
+  ex.built.clear();
+  if (!state.itineraries.length) return;
+  if (state.settings.exercise.enabled) runExercise();
+  renderResults();
 }
 
 function delayClass(leg) {
@@ -216,7 +473,7 @@ function delayClass(leg) {
 }
 
 function badge(leg) {
-  if (!leg.transit) return `<span class="badge WALK">🚶${Math.max(1, Math.round((leg.end - leg.start) / 60000))}</span>`;
+  if (!leg.transit) return `<span class="badge WALK${leg.exercise ? ' ex-tag' : ''}">${leg.exercise ? '🏃' : '🚶'}${Math.max(1, Math.round((leg.end - leg.start) / 60000))}</span>`;
   const style = leg.route?.color ? ` style="background:${esc(leg.route.color)}"` : '';
   return `<span class="badge ${esc(leg.mode)}"${style}>${esc(leg.route?.short || MODE_NAMES[leg.mode] || leg.mode)}</span>`;
 }
@@ -229,9 +486,10 @@ function timeCell(planned, actual, realtime) {
 
 function renderResults() {
   const box = $('#tab-results');
-  if (!state.itineraries.length) { box.innerHTML = ''; map.drawItinerary(null); return; }
+  if (!state.itineraries.length) { box.innerHTML = ''; map.drawItinerary(null); state.drawnKey = null; return; }
   const slackSec = state.settings.transferSlackMin * 60;
-  box.innerHTML = state.itineraries.map((it, i) => {
+  box.innerHTML = '<button type="button" id="btn-earlier" class="page-btn">▲ Earlier routes</button>' + state.itineraries.map((base, i) => {
+    const it = shown(base);
     const gaps = transferGaps(it);
     const tightest = gaps.length ? gaps.reduce((a, b) => (a.seconds < b.seconds ? a : b)) : null;
     const firstTransit = it.legs.find((l) => l.transit);
@@ -248,34 +506,43 @@ function renderResults() {
           <span>${it.transfers} transfer${it.transfers === 1 ? '' : 's'}</span>
           ${tightest ? `<span class="${tightest.seconds < slackSec + 60 ? 'tight' : ''}">tightest ${Math.round(tightest.seconds / 60)} min at ${esc(tightest.at)}</span>` : ''}
           <span>walk ${Math.round(it.walkDistance)} m</span>
+          ${it.exercise ? `<span class="ex-tag">🏃 ${km(it.exercise.distance)}${it.exercise.kcal ? ` · ${Math.round(it.exercise.kcal.total)} kcal` : ''}</span>` : ''}
         </div>
       </summary>
-      <div class="itin-body">${legDetails(it, i)}
+      <div class="itin-body">${exerciseBox(base, it, i)}${legDetails(it, i)}
         <div class="itin-actions">
           <button type="button" class="primary" data-start="${i}">Start trip</button>
         </div>
       </div>
     </details>`;
-  }).join('') + '<button type="button" id="btn-later">Later departures</button>';
+  }).join('') + '<button type="button" id="btn-later" class="page-btn">▼ Later routes</button>';
 
   for (const d of box.querySelectorAll('details.itin')) {
     d.addEventListener('toggle', () => {
-      if (!d.open) return;
+      // Toggle events are queued: ignore one from a card that a re-render has already replaced.
+      if (!d.open || !d.isConnected) return;
       for (const other of box.querySelectorAll('details.itin')) if (other !== d) other.open = false;
       state.openIndex = +d.dataset.i;
-      showItinerary(state.itineraries[state.openIndex]);
+      showItinerary(shown(state.itineraries[state.openIndex]));
     });
   }
-  box.querySelectorAll('[data-start]').forEach((b) => b.addEventListener('click', () => startTrip(state.itineraries[+b.dataset.start])));
+  box.querySelectorAll('[data-start]').forEach((b) => b.addEventListener('click', () => startTrip(shown(state.itineraries[+b.dataset.start]))));
   box.querySelectorAll('[data-planb]').forEach((b) => b.addEventListener('click', () => loadPlanB(b)));
-  $('#btn-later').addEventListener('click', () => search({ append: true }));
-  if (state.openIndex >= 0) showItinerary(state.itineraries[state.openIndex]);
+  box.querySelectorAll('[data-ex]').forEach((b) => b.addEventListener('click', () => {
+    ex.choice.set(state.itineraries[+b.dataset.ex].key, b.dataset.opt);
+    renderResults();
+  }));
+  $('#btn-earlier').addEventListener('click', () => search({ page: 'earlier' }));
+  $('#btn-later').addEventListener('click', () => search({ page: 'later' }));
+  renderPagingButtons();
+  if (state.openIndex >= 0) showItinerary(shown(state.itineraries[state.openIndex]));
 }
 
 function legDetails(it, itinIndex) {
   return it.legs.map((leg, li) => {
     if (!leg.transit) {
       const mins = Math.max(1, Math.round((leg.end - leg.start) / 60000));
+      if (leg.exercise) return `<div class="leg"><div class="t">${hhmm(leg.start)}</div><div class="what ex">🏃 Exercise walk ${mins} min (${km(leg.distance)}) to ${esc(leg.to.name)}</div></div>`;
       return `<div class="leg"><div class="t">${hhmm(leg.start)}</div><div class="what small">🚶 Walk ${mins} min (${Math.round(leg.distance)} m) to ${esc(leg.to.name)}</div></div>`;
     }
     const stopCode = leg.from.code ? ` <span class="small">${esc(leg.from.code)}${leg.from.platform ? ` · platform ${esc(leg.from.platform)}` : ''}</span>` : '';
@@ -294,7 +561,7 @@ function legDetails(it, itinIndex) {
 
 async function loadPlanB(btn, itinOverride) {
   const [ii, li] = btn.dataset.planb.split(':').map(Number);
-  const itinerary = itinOverride ?? state.itineraries[ii];
+  const itinerary = itinOverride ?? shown(state.itineraries[ii]);
   const out = btn.nextElementSibling;
   btn.disabled = true;
   out.hidden = false;
@@ -320,8 +587,9 @@ function describePlanB(r) {
 }
 
 /** Show an itinerary on the map and follow its vehicles. */
-function showItinerary(it, opts) {
-  map.drawItinerary(it, opts);
+function showItinerary(it, opts = {}) {
+  map.drawItinerary(it, { fit: (opts.fit ?? true) && it.key !== state.drawnKey });
+  state.drawnKey = it.key;
   if (state.displayedLegs !== it.legs) {
     map.clearVehicles();
     state.vehicles.clear();
@@ -434,7 +702,19 @@ let refreshTimer = null;
 let wakeLock = null;
 
 async function startTrip(it) {
-  state.trip = { it, planB: new Map(), lastRefresh: 0 };
+  if (state.trip) stopGps(state.trip);
+  state.trip = {
+    base: it, // as started: what "late" and "early" are measured against
+    it, // with live times applied
+    updated: new Map(), // legIndex -> transit leg with live times
+    planB: new Map(),
+    lastRefresh: 0,
+    alerted: new Set(), // notices already announced with a vibration
+    gps: null, // geolocation watch id
+    pace: null, // { legIndex, kind, tracker } for the walk being tracked
+    paceDone: new Set(),
+    paceNote: '',
+  };
   activateTab('trip');
   showItinerary(it);
   await requestWakeLock();
@@ -442,11 +722,13 @@ async function startTrip(it) {
   clearInterval(refreshTimer);
   tickTimer = setInterval(renderTrip, 1000);
   refreshTimer = setInterval(refreshTrip, 30_000);
+  if (state.settings.trackPace || it.exercise) startGps();
   renderTrip();
   refreshTrip();
 }
 
 function stopTrip() {
+  stopGps(state.trip);
   state.trip = null;
   clearInterval(tickTimer);
   clearInterval(refreshTimer);
@@ -467,26 +749,182 @@ document.addEventListener('visibilitychange', () => {
 
 async function refreshTrip() {
   const trip = state.trip;
-  if (!trip || isDemo()) return;
+  if (!trip) return;
   const now = Date.now();
-  const legs = trip.it.legs.slice();
+  const legs = trip.it.legs;
   const upcoming = legs.map((l, i) => i).filter((i) => legs[i].transit && legs[i].end > now && legs[i].trip?.id && legs[i].serviceDate).slice(0, 2);
-  let changed = false;
   for (const i of upcoming) {
     try {
       const times = await api.tripTimes(legs[i].trip.id, legs[i].serviceDate);
-      const updated = applyLiveTimes(legs[i], times);
-      if (updated.start !== legs[i].start || updated.end !== legs[i].end) { legs[i] = updated; changed = true; }
+      trip.updated.set(i, applyLiveTimes(trip.base.legs[i], times));
     } catch (e) {
       console.warn('live time refresh failed', e);
     }
   }
-  if (changed && state.trip === trip) {
-    trip.it = withLegs(trip.it, legs);
+  if (state.trip !== trip) return;
+  const next = liveItinerary(trip.base, trip.updated);
+  const changed = next.legs.some((l, i) => l.start !== trip.it.legs[i].start || l.end !== trip.it.legs[i].end);
+  if (changed) {
+    trip.it = next;
     trip.planB.clear();
     state.displayedLegs = trip.it.legs;
   }
   trip.lastRefresh = Date.now();
+}
+
+// ---------- pace (GPS) ----------
+
+function startGps() {
+  const trip = state.trip;
+  if (!trip || trip.gps !== null || !navigator.geolocation) return;
+  trip.gpsError = '';
+  trip.gps = navigator.geolocation.watchPosition(
+    (pos) => onPosition(trip, pos),
+    (err) => { trip.gpsError = err.code === 1 ? 'Location permission was denied, so pace tracking is off.' : 'Waiting for GPS…'; },
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 },
+  );
+}
+
+function stopGps(trip) {
+  if (!trip) return;
+  if (trip.gps !== null) navigator.geolocation?.clearWatch(trip.gps);
+  trip.gps = null;
+  finishPace(trip);
+  map.setMe(null);
+}
+
+/** Which walk to measure now: keep the current one until you reach its end or its vehicle leaves. */
+function paceLegIndex(trip, now) {
+  const it = trip.it;
+  const cur = trip.pace;
+  if (cur) {
+    const next = it.legs.findIndex((l, i) => i > cur.legIndex && l.transit);
+    const est = cur.tracker.estimate();
+    const arrived = est && est.remaining < 25;
+    const over = next >= 0 ? now > it.legs[next].start + 60_000 : now > it.end + 15 * 60_000;
+    if (!arrived && !over) return cur.legIndex;
+  }
+  const ph = tripPhase(it, now);
+  if (ph.phase === 'ride' || ph.phase === 'done') return -1;
+  const i = ph.phase === 'before' ? 0 : ph.legIndex;
+  const leg = it.legs[i];
+  return leg && !leg.transit && leg.points && i !== cur?.legIndex && !trip.paceDone.has(i) ? i : -1;
+}
+
+function onPosition(trip, pos) {
+  if (state.trip !== trip) return;
+  const fix = { lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy, t: pos.timestamp || Date.now() };
+  trip.gpsError = '';
+  map.setMe(fix);
+  const li = paceLegIndex(trip, Date.now());
+  if (trip.pace && trip.pace.legIndex !== li) finishPace(trip);
+  if (li >= 0 && !trip.pace) {
+    const leg = trip.it.legs[li];
+    const kind = leg.exercise ? 'exercise' : 'walk';
+    const planned = kind === 'exercise' ? exerciseSpeed() : state.settings.walkSpeedKmh;
+    trip.pace = { legIndex: li, kind, tracker: createPaceTracker({ path: leg.points, prior: pacePrior(state.pace[kind], planned) }) };
+  }
+  trip.pace?.tracker.addFix(fix);
+}
+
+/** Ends the measured walk and, if it was long and clean enough, adds its speed to the learned pace. */
+function finishPace(trip) {
+  const p = trip?.pace;
+  if (!p) return;
+  trip.pace = null;
+  trip.paceDone.add(p.legIndex);
+  const v = p.tracker.segmentSpeed();
+  if (!v) return;
+  const r = recordPace(state.pace, p.kind, v);
+  if (!r.accepted) return;
+  state.pace = r.stats;
+  savePace(state.pace);
+  renderExerciseForm();
+  const leg = trip.it.legs[p.legIndex];
+  const kcal = leg.exercise ? walkingKcal({ distanceM: leg.distance, speedKmh: v * 3.6, ...body() }) : null;
+  trip.paceNote = `${p.kind === 'exercise' ? '🏃 Exercise walk' : '🚶 Walk'} done at ${(v * 3.6).toFixed(1)} km/h${kcal ? `, ≈ ${Math.round(kcal.total)} kcal` : ''}. Saved to your measured pace.`;
+}
+
+function paceLine(trip, now, phase) {
+  if (trip.gps === null) return '';
+  if (trip.gpsError) return `<span class="small">📍 ${esc(trip.gpsError)}</span>`;
+  const p = trip.pace;
+  if (!p) return '';
+  const leg = trip.it.legs[p.legIndex];
+  const est = p.tracker.estimate();
+  if (!est) return `<span class="small">📍 Measuring your pace… (${p.tracker.fixes} GPS fixes)</span>`;
+  const stopped = est.live < 0.3;
+  if (stopped && phase === 'before') return '<span class="small">📍 GPS ready. Your pace shows once you start walking.</span>';
+  // Standing still (lights, a shop door) shouldn't make the ETA explode: use your usual pace meanwhile.
+  const speed = stopped ? pacePrior(state.pace[p.kind], p.kind === 'exercise' ? exerciseSpeed() : state.settings.walkSpeedKmh).mean : est.speed;
+  const eta = now + (est.remaining / speed) * 1000;
+  let line = `📍 ${stopped ? 'Stopped' : `Your pace <b>${(est.speed * 3.6).toFixed(1)} km/h</b>`} · at ${esc(leg.to.name)} <b>${hhmm(eta)}</b> (${km(est.remaining)} to go)`;
+  const next = trip.it.legs.findIndex((l, i) => i > p.legIndex && l.transit);
+  if (next >= 0) {
+    const dep = trip.it.legs[next].start;
+    const spare = dep - eta;
+    if (spare >= 60_000) {
+      line += ` · <span class="ontime">${Math.floor(spare / 60000)} min to spare</span>`;
+    } else if (spare >= 0) {
+      line += ' · <span class="early">under a minute to spare</span>';
+    } else {
+      const need = est.remaining / Math.max(1, (dep - now) / 1000);
+      line += need <= 2.5
+        ? ` · <span class="late">${Math.ceil(-spare / 60000)} min short: speed up to ${(need * 3.6).toFixed(1)} km/h</span>`
+        : ' · <span class="late">you probably won\'t make it: see plan B</span>';
+    }
+  }
+  if (est.offRoute) line += ' <span class="small">(you\'re off the planned path)</span>';
+  return `<span class="pace">${line}</span>`;
+}
+
+// ---------- trip screen ----------
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+function noticeHtml(n, it, ph) {
+  const leg = n.legIndex !== undefined ? it.legs[n.legIndex] : null;
+  const mins = (sec) => Math.abs(Math.round(sec / 60));
+  switch (n.kind) {
+    case 'early':
+      if (n.first && ph.phase === 'before' && n.leaveWas - n.leaveNow < 60_000) {
+        return `<div class="notice">⚠️ <b>${badge(leg)} is running ${mins(n.deltaSec)} min early</b>: it leaves ${hhmm(n.now)} <s>${hhmm(n.was)}</s>. Leaving at ${hhmm(n.leaveNow)} as planned still gets you there.</div>`;
+      }
+      if (n.first && ph.phase === 'before') {
+        return `<div class="notice bad">⚠️ <b>${badge(leg)} is running ${mins(n.deltaSec)} min early</b>: it leaves ${hhmm(n.now)} <s>${hhmm(n.was)}</s>. <b>Leave by ${hhmm(n.leaveNow)}</b> <s>${hhmm(n.leaveWas)}</s>.</div>`;
+      }
+      return `<div class="notice bad">⚠️ <b>${badge(leg)} is running ${mins(n.deltaSec)} min early</b>: it leaves ${esc(leg.from.name)} at ${hhmm(n.now)} <s>${hhmm(n.was)}</s>. Don't dawdle.</div>`;
+    case 'late': {
+      const spare = n.first && ph.phase === 'before'
+        ? ` Your leave time stays ${hhmm(n.leaveNow)}, so you'll have ${plural(mins(n.deltaSec), 'extra minute')} at the stop.`
+        : (n.first ? ` You'll have ${plural(mins(n.deltaSec), 'extra minute')} at the stop.` : '');
+      return `<div class="notice">🕒 <b>${badge(leg)} is ${mins(n.deltaSec)} min late</b>: it leaves ${hhmm(n.now)} <s>${hhmm(n.was)}</s>.${spare}</div>`;
+    }
+    case 'tight':
+      return `<div class="notice bad">⚠️ <b>Transfer at ${esc(n.at)} is down to ${mins(n.seconds)} min</b> (you wanted ${state.settings.transferSlackMin}). Plan B is below.</div>`;
+    case 'missed':
+      return `<div class="notice bad">❌ <b>You'll probably miss ${badge(it.legs[n.toLeg])} at ${esc(n.at)}</b>: ${mins(n.seconds)} min short. Plan B is below.</div>`;
+    case 'arrival':
+      return `<div class="notice ${n.deltaSec > 0 ? '' : 'good'}">Arrival now <b>${hhmm(n.now)}</b> <s>${hhmm(n.was)}</s></div>`;
+    default:
+      return '';
+  }
+}
+
+/** Vibrates (and flashes the banner) once for each new early-vehicle or transfer problem. */
+function announce(trip, notices) {
+  let fresh = false;
+  for (const n of notices) {
+    if (n.kind !== 'early' && n.kind !== 'tight' && n.kind !== 'missed') continue;
+    const key = `${n.kind}:${n.legIndex ?? n.toLeg}:${Math.round((n.deltaSec ?? n.seconds) / 60)}`;
+    if (trip.alerted.has(key)) continue;
+    trip.alerted.add(key);
+    fresh = true;
+  }
+  if (fresh) {
+    try { navigator.vibrate?.([250, 120, 250]); } catch { /* not supported */ }
+    trip.flashUntil = Date.now() + 3000;
+  }
 }
 
 function renderTrip() {
@@ -497,19 +935,26 @@ function renderTrip() {
   const ph = tripPhase(it, now);
   const out = $('#trip-out');
   if (ph.phase === 'done') {
-    out.innerHTML = `<div class="timer"><div class="count">🎉</div><div>You've arrived (${hhmm(it.end)}).</div></div><div class="itin-actions"><button type="button" id="btn-stop">Close</button></div>`;
+    stopGps(trip);
+    out.innerHTML = `<div class="timer"><div class="count">🎉</div><div>You've arrived (${hhmm(it.end)}).</div>${trip.paceNote ? `<div class="small">${esc(trip.paceNote)}</div>` : ''}</div><div class="itin-actions"><button type="button" id="btn-stop">Close</button></div>`;
     $('#btn-stop').onclick = stopTrip;
     clearInterval(tickTimer);
     return;
   }
+  const slackSec = state.settings.transferSlackMin * 60;
+  const notices = tripNotices(trip.base, it, now, slackSec);
+  announce(trip, notices);
+
   const subs = [];
   const nextLeg = ph.nextTransit >= 0 ? it.legs[ph.nextTransit] : null;
+  const pace = paceLine(trip, now, ph.phase);
+  const measuring = pace.includes('class="pace"');
   if (ph.phase === 'before' || ph.phase === 'walk' || ph.phase === 'wait') {
     if (nextLeg) {
       subs.push(`${badge(nextLeg)} from <b>${esc(nextLeg.from.name)}</b> at ${hhmm(nextLeg.start)}${nextLeg.realtime ? ` <span class="${delayClass(nextLeg)}">(live)</span>` : ''}`);
       const v = state.vehicles.get(ph.nextTransit);
-      if (v) subs.push(`<span class="live-note">Vehicle is ${km(distance(v, nextLeg.from))} away${v.delaySec !== null ? `, ${delayText(v.delaySec)}` : ''}</span>`);
-      if (ph.phase === 'walk' && ph.walkLeftSec) subs.push(`<span class="small">Walking about ${Math.ceil(ph.walkLeftSec / 60)} min left</span>`);
+      if (v) subs.push(`<span class="live-note">Vehicle is ${km(haversine(v, nextLeg.from))} away${v.delaySec !== null ? `, ${delayText(v.delaySec)}` : ''}</span>`);
+      if (ph.phase === 'walk' && ph.walkLeftSec && !measuring) subs.push(`<span class="small">Walking about ${Math.ceil(ph.walkLeftSec / 60)} min left</span>`);
     }
     subs.push(`<span class="small">Arrive at destination ${hhmm(it.end)}</span>`);
   } else if (ph.phase === 'ride') {
@@ -517,13 +962,19 @@ function renderTrip() {
     const v = state.vehicles.get(ph.legIndex);
     if (v?.delaySec !== null && v?.delaySec !== undefined) subs.push(`<span class="live-note">${badge(leg)} ${delayText(v.delaySec)}</span>`);
     if (nextLeg && ph.transferSlackSec !== null) {
-      const tight = ph.transferSlackSec < state.settings.transferSlackMin * 60;
+      const tight = ph.transferSlackSec < slackSec;
       subs.push(`<span class="${tight ? 'warnline' : ''}">Transfer to ${badge(nextLeg)} at ${hhmm(nextLeg.start)}: ${Math.round(ph.transferSlackSec / 60)} min to spare</span>`);
     }
     subs.push(`<span class="small">Arrive at destination ${hhmm(it.end)}</span>`);
   }
+  if (pace) subs.push(pace);
+  if (it.exercise) subs.push(`<span class="ex-tag">🏃 ${km(it.exercise.distance)} exercise walk · ${it.exercise.kcal ? `≈ ${Math.round(it.exercise.kcal.total)} kcal` : 'add weight and height in Settings for calories'}</span>`);
+  if (trip.paceNote) subs.push(`<span class="small">${esc(trip.paceNote)}</span>`);
 
-  const planBLeg = nextLeg && (ph.phase !== 'ride' || (ph.transferSlackSec ?? 1e9) < state.settings.transferSlackMin * 60 + 60) ? ph.nextTransit : -1;
+  // Plan B: for a transfer that has become tight or impossible, else for the next vehicle.
+  const risky = notices.find((n) => n.kind === 'missed' || n.kind === 'tight');
+  const planBLeg = risky ? risky.toLeg
+    : (nextLeg && (ph.phase !== 'ride' || (ph.transferSlackSec ?? 1e9) < slackSec + 60) ? ph.nextTransit : -1);
   if (planBLeg >= 0 && !trip.planB.has(planBLeg)) {
     trip.planB.set(planBLeg, null);
     planB({ plan: (o) => api.plan(state.settings, o), itinerary: it, legIndex: planBLeg, to: lastPlace(it) })
@@ -531,18 +982,31 @@ function renderTrip() {
       .catch(() => trip.planB.set(planBLeg, false));
   }
   const pb = planBLeg >= 0 ? trip.planB.get(planBLeg) : undefined;
+  const flash = (trip.flashUntil ?? 0) > now;
+
+  const timeCol = (l, i) => {
+    const was = trip.base.legs[i]?.start;
+    if (was === undefined || Math.abs(l.start - was) < 60_000) return hhmm(l.start);
+    return `<b class="${l.start > was ? 'late' : 'early'}">${hhmm(l.start)}</b> <s>${hhmm(was)}</s>`;
+  };
 
   out.innerHTML = `
+    ${notices.length ? `<div class="notices">${notices.map((n) => noticeHtml(n, it, ph)).join('').replace(/class="notice bad"/g, `class="notice bad${flash ? ' flash' : ''}"`)}</div>` : ''}
     <div class="timer ${ph.phase}">
       <div class="label">${esc(ph.label)}</div>
       <div class="count">${fmtCountdown(ph.target - now)}</div>
       <div class="sub">${subs.map((x) => `<div>${x}</div>`).join('')}</div>
     </div>
     ${pb ? `<div class="planb"><div class="res">If you miss it: ${describePlanB(pb)} <button type="button" id="btn-switch">Switch to this</button></div></div>` : ''}
-    <ol class="trip-legs">${it.legs.map((l, i) => `<li class="${l.end <= now ? 'done' : (i === ph.legIndex ? 'now' : '')}">${hhmm(l.start)} ${badge(l)} ${l.transit ? `${esc(l.from.name)} → ${esc(l.to.name)}` : `walk to ${esc(l.to.name)}`}</li>`).join('')}</ol>
-    <div class="itin-actions"><button type="button" id="btn-stop">End trip</button></div>
-    <p class="small">${wakeLock ? 'Screen stays on during the trip.' : ''} ${isDemo() ? 'Demo data.' : 'Times refresh every 30 s.'}</p>`;
+    <ol class="trip-legs">${it.legs.map((l, i) => `<li class="${l.end <= now ? 'done' : (i === ph.legIndex ? 'now' : '')}">${timeCol(l, i)} ${badge(l)} ${l.transit ? `${esc(l.from.name)} → ${esc(l.to.name)}` : `${l.exercise ? 'exercise walk' : 'walk'} to ${esc(l.to.name)}`}</li>`).join('')}</ol>
+    <div class="itin-actions">
+      <button type="button" id="btn-stop">End trip</button>
+      ${navigator.geolocation ? `<button type="button" id="btn-gps">${trip.gps !== null ? '📍 Stop pace tracking' : '📍 Track my pace'}</button>` : ''}
+    </div>
+    <p class="small">${wakeLock ? 'Screen stays on during the trip.' : ''} ${isDemo() ? 'Demo data: delays change every 45 s.' : 'Times refresh every 30 s.'}</p>`;
   $('#btn-stop').onclick = stopTrip;
+  const gpsBtn = $('#btn-gps');
+  if (gpsBtn) gpsBtn.onclick = () => { if (trip.gps !== null) stopGps(trip); else startGps(); renderTrip(); };
   if (pb) $('#btn-switch').onclick = () => startTrip(joinPlanB(it, planBLeg, pb.itinerary));
 }
 
@@ -553,14 +1017,6 @@ function joinPlanB(it, legIndex, alt) {
   return { ...alt, legs, start: legs[0].start, end: alt.end, duration: Math.round((alt.end - legs[0].start) / 1000), key: `${it.key}+${alt.key}` };
 }
 
-function distance(a, b) {
-  const R = 6371e3;
-  const toRad = (d) => (d * Math.PI) / 180;
-  const dLat = toRad(b.lat - a.lat);
-  const dLon = toRad(b.lon - a.lon);
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(h));
-}
 const km = (m) => (m < 1000 ? `${Math.round(m / 10) * 10} m` : `${(m / 1000).toFixed(1)} km`);
 function delayText(sec) {
   const m = Math.round(sec / 60);
@@ -578,9 +1034,21 @@ function openSettings() {
   $('#set-maxtr').value = s.maxTransfers === null ? '' : String(s.maxTransfers);
   $('#set-wheelchair').checked = s.wheelchair;
   $('#set-avoid').value = s.avoidLines.join(', ');
+  $('#set-weight').value = s.weightKg ?? '';
+  $('#set-height').value = s.heightCm ?? '';
+  $('#set-trackpace').checked = s.trackPace;
+  renderPaceStats();
   $('#set-modes').innerHTML = MODES.map((m) => `<label><input type="checkbox" value="${m}" ${s.modes.includes(m) ? 'checked' : ''}> ${MODE_NAMES[m]}</label>`).join('');
   renderPlaceList();
   $('#settings').showModal();
+}
+
+function renderPaceStats() {
+  const line = (label, st) => (st.n
+    ? `${label}: <b>${(st.mean * 3.6).toFixed(1)} km/h</b> ± ${(Math.sqrt(st.var) * 3.6).toFixed(1)} from ${st.n} walk${st.n === 1 ? '' : 's'}`
+    : `${label}: nothing measured yet`);
+  $('#pace-stats').innerHTML = `${line('Measured walking pace', state.pace.walk)}<br>${line('Measured exercise pace', state.pace.exercise)}`;
+  $('#btn-pace-use').disabled = !state.pace.walk.n;
 }
 
 function renderPlaceList() {
@@ -606,10 +1074,15 @@ function saveFromDialog() {
     wheelchair: $('#set-wheelchair').checked,
     avoidLines: $('#set-avoid').value.split(/[,\s]+/),
     modes: [...$('#set-modes').querySelectorAll('input:checked')].map((i) => i.value),
+    weightKg: $('#set-weight').value,
+    heightCm: $('#set-height').value,
+    trackPace: $('#set-trackpace').checked,
   };
+  state.settings = sanitize(state.settings);
   persist();
-  state.settings = loadSettings();
   renderSlack();
+  ex.built.clear();
+  if (state.itineraries.length) renderResults();
   if (state.settings.apiKey !== oldKey) {
     map.setTiles(state.settings.apiKey);
     if (oldDemo !== isDemo()) resetTracker();
@@ -657,6 +1130,18 @@ function bind() {
   $('#btn-settings').addEventListener('click', openSettings);
   $('#slack-minus').addEventListener('click', () => changeSlack(-1));
   $('#slack-plus').addEventListener('click', () => changeSlack(1));
+  document.querySelectorAll('[data-shift]').forEach((b) => b.addEventListener('click', () => shiftTime(+b.dataset.shift)));
+  for (const id of ['#ex-on', '#ex-where', '#ex-min', '#ex-max', '#ex-speed', '#ex-measured']) $(id).addEventListener('change', onExerciseChange);
+  $('#btn-pace-use').addEventListener('click', () => {
+    const v = learnedKmh(state.pace.walk);
+    if (v) $('#set-walk').value = (Math.round(v * 2) / 2).toFixed(1);
+  });
+  $('#btn-pace-reset').addEventListener('click', () => {
+    if (!confirm('Forget your measured walking and exercise pace?')) return;
+    state.pace = resetPace();
+    renderPaceStats();
+    renderExerciseForm();
+  });
   document.querySelectorAll('.tabs button').forEach((b) => b.addEventListener('click', () => activateTab(b.dataset.tab)));
 
   $('#btn-swap').addEventListener('click', () => {
@@ -746,6 +1231,7 @@ function init() {
   bind();
   renderSlack();
   renderSavedPlaces();
+  renderExerciseForm();
   map.setTiles(state.settings.apiKey);
   $('#sweep-date').value = helsinkiDate(Date.now());
   $('#sweep-from').value = state.settings.sweepFromHour;
@@ -760,4 +1246,4 @@ function init() {
 init();
 
 // Exposed for debugging in the browser console.
-globalThis.__rp = { state, modeColor };
+globalThis.__rp = { state, ex, modeColor };

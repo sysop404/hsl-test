@@ -16,6 +16,18 @@ export const DEFAULTS = Object.freeze({
   places: [], // saved places: { name, lat, lon }
   sweepFromHour: 5,
   sweepToHour: 24,
+  // Exercise mode: walk part of the trip on purpose.
+  exercise: Object.freeze({
+    enabled: false,
+    where: 'last', // 'last' = get off early near the destination, 'first' = board later near the origin
+    minM: 800,
+    maxM: 1500,
+    speedKmh: 6, // only for the exercise walk; other walks use walkSpeedKmh
+    useMeasured: true, // use the learned exercise pace once there are enough walks
+  }),
+  weightKg: null, // for the calorie estimate
+  heightCm: null,
+  trackPace: true, // GPS pace and ETA on walks during a trip
 });
 
 function storage() {
@@ -61,6 +73,26 @@ export function sanitize(s) {
       ? s.places.filter((p) => p && p.name && Number.isFinite(p.lat) && Number.isFinite(p.lon)) : [],
     sweepFromHour: num(s.sweepFromHour, 0, 23, DEFAULTS.sweepFromHour),
     sweepToHour: num(s.sweepToHour, 1, 28, DEFAULTS.sweepToHour),
+    exercise: sanitizeExercise(s.exercise),
+    weightKg: s.weightKg === null || s.weightKg === '' || s.weightKg === undefined ? null : num(s.weightKg, 25, 250, null),
+    heightCm: s.heightCm === null || s.heightCm === '' || s.heightCm === undefined ? null : num(s.heightCm, 100, 230, null),
+    trackPace: s.trackPace === undefined ? DEFAULTS.trackPace : !!s.trackPace,
+  };
+}
+
+function sanitizeExercise(e) {
+  const d = DEFAULTS.exercise;
+  e = e && typeof e === 'object' ? e : {};
+  const num = (v, lo, hi, def) => (Number.isFinite(+v) && v !== '' && v !== null ? Math.min(hi, Math.max(lo, +v)) : def);
+  const minM = Math.round(num(e.minM, 100, 10000, d.minM));
+  const maxM = Math.round(num(e.maxM, 100, 15000, d.maxM));
+  return {
+    enabled: !!e.enabled,
+    where: e.where === 'first' ? 'first' : 'last',
+    minM: Math.min(minM, maxM),
+    maxM: Math.max(minM, maxM),
+    speedKmh: num(e.speedKmh, 2, 10, d.speedKmh),
+    useMeasured: e.useMeasured === undefined ? d.useMeasured : !!e.useMeasured,
   };
 }
 

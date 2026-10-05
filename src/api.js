@@ -1,6 +1,7 @@
 // Digitransit API client. Every request carries the user's own subscription key.
 
-import { PLAN_QUERY, ROUTES_QUERY, TRIP_TIMES_QUERY, buildPlanVariables, normalizePlanResponse, withoutAvoided } from './plan.js';
+import { PLAN_QUERY, ROUTES_QUERY, TRIP_TIMES_QUERY, buildPlanVariables, normalizePlanResponse, toLocation, walkQuery, withoutAvoided } from './plan.js';
+import { joinPolylines } from './polyline.js';
 import { compactDate } from './time.js';
 
 export const ROUTING_URL = 'https://api.digitransit.fi/routing/v2/hsl/gtfs/v1';
@@ -70,6 +71,31 @@ export function createApi({ getKey, fetchImpl = (...a) => globalThis.fetch(...a)
       const data = await graphql(PLAN_QUERY, buildPlanVariables(settings, { ...opts, avoidRouteIds }));
       const out = normalizePlanResponse(data);
       out.itineraries = withoutAvoided(out.itineraries, settings.avoidLines);
+      return out;
+    },
+
+    /**
+     * Walking routes for [{ from, to }] pairs: [{ distance (m), points } | null] in the same order.
+     * Batched into a few requests with aliases.
+     */
+    async walks(pairs, speedKmh, batch = 12) {
+      const out = [];
+      for (let k = 0; k < pairs.length; k += batch) {
+        const chunk = pairs.slice(k, k + batch);
+        const vars = { p: { street: { walk: { speed: +(speedKmh / 3.6).toFixed(3) } } } };
+        // Coordinates rather than stop ids, so the walk starts at the stop pole, not anywhere in its station.
+        const at = (p) => toLocation({ name: p.name, lat: p.lat, lon: p.lon });
+        chunk.forEach((pair, i) => { vars[`o${i}`] = at(pair.from); vars[`d${i}`] = at(pair.to); });
+        const data = await graphql(walkQuery(chunk.length), vars);
+        chunk.forEach((_, i) => {
+          const node = data?.[`w${i}`]?.edges?.[0]?.node;
+          const legs = node?.legs ?? [];
+          out.push(legs.length ? {
+            distance: legs.reduce((s, l) => s + (l.distance ?? 0), 0),
+            points: joinPolylines(legs.map((l) => l.legGeometry?.points ?? '')),
+          } : null);
+        });
+      }
       return out;
     },
 

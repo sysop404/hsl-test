@@ -50,12 +50,37 @@
           </select>
           <input id="when-time" type="datetime-local" hidden aria-label="Time">
         </div>
+        <div class="shift" role="group" aria-label="Search a bit earlier or later">
+          <button type="button" data-shift="-30">−30 min</button>
+          <button type="button" data-shift="-15">−15</button>
+          <button type="button" data-shift="15">+15</button>
+          <button type="button" data-shift="30">+30</button>
+          <button type="button" data-shift="60">+1 h</button>
+        </div>
 
         <div class="slack">
           <span>Min transfer</span>
           <button type="button" class="step" id="slack-minus" aria-label="Less transfer time">−</button>
           <output id="slack-value">3 min</output>
           <button type="button" class="step" id="slack-plus" aria-label="More transfer time">+</button>
+        </div>
+
+        <div class="exercise">
+          <div class="ex-head">
+            <label class="inline"><input type="checkbox" id="ex-on"> 🏃 Exercise</label>
+            <span id="ex-summary" class="small"></span>
+          </div>
+          <div id="ex-opts" class="ex-opts" hidden>
+            <label class="wide">Where <select id="ex-where">
+              <option value="last">Near the destination: get off early</option>
+              <option value="first">From the start: get on a few stops later</option>
+            </select></label>
+            <label>Min walk (m) <input id="ex-min" type="number" min="100" max="10000" step="100"></label>
+            <label>Max walk (m) <input id="ex-max" type="number" min="100" max="15000" step="100"></label>
+            <label>Exercise speed (km/h) <input id="ex-speed" type="number" min="2" max="10" step="0.1"></label>
+            <label class="inline wide"><input type="checkbox" id="ex-measured"> <span id="ex-measured-label">Use my measured pace</span></label>
+            <p class="small wide">Only the exercise walk uses this speed; other walks use the walking speed in Settings.</p>
+          </div>
         </div>
 
         <div class="actions">
@@ -113,6 +138,19 @@
         <label class="inline"><input type="checkbox" id="set-wheelchair"> Wheelchair accessible only</label>
         <div class="modes" id="set-modes"></div>
         <label>Avoid lines <input id="set-avoid" type="text" placeholder="e.g. 550, 200"></label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Exercise and pace</legend>
+        <label>Weight (kg) <input id="set-weight" type="number" min="25" max="250" step="1" placeholder="for calories"></label>
+        <label>Height (cm) <input id="set-height" type="number" min="100" max="230" step="1" placeholder="for calories"></label>
+        <label class="inline"><input type="checkbox" id="set-trackpace"> Track my walking pace with GPS during trips</label>
+        <div id="pace-stats" class="small"></div>
+        <div class="row-actions">
+          <button type="button" id="btn-pace-use">Use measured pace as walking speed</button>
+          <button type="button" id="btn-pace-reset" class="danger">Forget measured pace</button>
+        </div>
+        <p class="small">Pace is measured only while a trip is running, and stays in this browser. Calories are an estimate from weight, height, distance and speed (Ludlow &amp; Weyand 2016).</p>
       </fieldset>
 
       <fieldset>

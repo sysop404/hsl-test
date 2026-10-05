@@ -21,9 +21,22 @@ const dist = (a, b) => {
   return Math.hypot(dx, dy);
 };
 
-function leg({ mode, from, to, start, end, route, trip, headsign, delay = 0 }) {
+// Demo state shared between searches: stops by id (so stop-to-stop searches work) and each trip's
+// scheduled stop times (so live time refreshes can be simulated).
+const STOPS = new Map();
+const TRIPS = new Map();
+
+function legTime(t, delay, transit) {
+  return { scheduledTime: iso(t), estimated: transit && delay ? { time: iso(t + delay * 1000), delay: `PT${delay}S` } : null };
+}
+
+function leg({ mode, from, to, start, end, route, trip, headsign, delay = 0, stops = [] }) {
   const transit = mode !== 'WALK';
-  const lt = (t) => ({ scheduledTime: iso(t), estimated: transit && delay ? { time: iso(t + delay * 1000), delay: `PT${delay}S` } : null });
+  const lt = (t) => legTime(t, delay, transit);
+  const path = transit
+    ? [from, ...stops, to].map((p) => [p.lat, p.lon])
+    : [[from.lat, from.lon], [(from.lat + to.lat) / 2 + 0.002, (from.lon + to.lon) / 2], [to.lat, to.lon]];
+  if (trip) TRIPS.set(trip.gtfsId, [{ stopId: from.stopId, t: start }, ...stops.map((x) => ({ stopId: x.stopId, t: x.t })), { stopId: to.stopId, t: end }]);
   return {
     mode, distance: dist(from, to) * 1000, duration: (end - start) / 1000, transitLeg: transit,
     headsign: headsign ?? null, serviceDate: transit ? serviceDate(start) : null, realtimeState: delay ? 'UPDATED' : 'SCHEDULED',
@@ -33,9 +46,30 @@ function leg({ mode, from, to, start, end, route, trip, headsign, delay = 0 }) {
     to: { name: to.name, lat: to.lat, lon: to.lon, stop: to.stopId ? { gtfsId: to.stopId, code: to.code, platformCode: null } : null },
     route: route ?? null,
     trip: trip ?? null,
-    legGeometry: { points: encodePolyline([[from.lat, from.lon], [(from.lat + to.lat) / 2 + 0.002, (from.lon + to.lon) / 2], [to.lat, to.lon]]) },
+    legGeometry: { points: encodePolyline(path) },
     alerts: [],
+    intermediatePlaces: stops.map((x) => ({
+      name: x.name, lat: x.lat, lon: x.lon, arrival: lt(x.t), departure: lt(x.t),
+      stop: { gtfsId: x.stopId, code: x.code, platformCode: null },
+    })),
   };
+}
+
+/** Stops roughly every 450 m between two stops, with times interpolated along the ride. */
+function between(from, to, start, end, line) {
+  const n = Math.min(30, Math.max(0, Math.round((dist(from, to) * 1000) / 450) - 1));
+  const out = [];
+  for (let i = 1; i <= n; i++) {
+    const f = i / (n + 1);
+    const p = stop(lerp(from, to, f), 0, `${line} pysäkki ${i}`);
+    p.stopId = `HSL:${line}${String(i).padStart(2, '0')}`;
+    p.code = `H${line}${i}`;
+    // Stops along a line sit a little off the straight line, like real streets.
+    p.lat += 0.0006 * Math.sin(i * 1.7);
+    STOPS.set(p.stopId, p);
+    out.push({ ...p, t: Math.round(start + (end - start) * f) });
+  }
+  return out;
 }
 
 function serviceDate(ms) {
@@ -52,19 +86,24 @@ function profile(ms) {
 }
 
 function stop(p, id, name) {
-  return { ...p, name, stopId: `HSL:${id}`, code: `H${id % 10000}` };
+  const s = { ...p, name, stopId: `HSL:${id}`, code: `H${id % 10000}` };
+  STOPS.set(s.stopId, s);
+  return s;
 }
 
-function buildItineraries(vars) {
-  const o = vars.origin.location.coordinate ?? { latitude: 60.1711, longitude: 24.9441 };
-  const d = vars.destination.location.coordinate ?? { latitude: 60.2103, longitude: 25.0814 };
-  const A = { name: vars.origin.label ?? 'Origin', lat: o.latitude, lon: o.longitude };
-  const B = { name: vars.destination.label ?? 'Destination', lat: d.latitude, lon: d.longitude };
+function endpoint(loc, fallback) {
+  const c = loc.location.coordinate;
+  if (c) return { name: loc.label ?? fallback.name, lat: c.latitude, lon: c.longitude };
+  const s = STOPS.get(loc.location.stopLocation?.stopLocationId);
+  return s ? { name: loc.label ?? s.name, lat: s.lat, lon: s.lon } : fallback;
+}
+
+/** Departures from t0 onwards, for `horizonSec` (both patterns). */
+function generate(vars, t0, horizonSec) {
+  const A = endpoint(vars.origin, { name: 'Origin', lat: 60.1711, lon: 24.9441 });
+  const B = endpoint(vars.destination, { name: 'Destination', lat: 60.2103, lon: 25.0814 });
   const slack = parseDuration(vars.preferences?.transit?.transfer?.slack ?? 'PT2M');
   const maxTransfers = vars.preferences?.transit?.transfer?.maximumTransfers ?? 9;
-  const first = vars.first ?? 6;
-  const windowSec = vars.searchWindow ? parseDuration(vars.searchWindow) : 3600;
-  const t0 = Date.parse(vars.dateTime?.earliestDeparture ?? new Date().toISOString());
 
   const s1 = stop(lerp(A, B, 0.08), 1001, 'Lähtöpysäkki');
   const sx = stop(lerp(A, B, 0.55), 1002, 'Vaihtopysäkki');
@@ -74,10 +113,10 @@ function buildItineraries(vars) {
   const out = [];
 
   // Pattern 1: bus 550 then tram 4 (one transfer). Pattern 2: direct bus 52 (slower, less frequent).
-  for (let k = 0; out.length < first * 2 && k < 40; k++) {
+  for (let k = 0; k < 60; k++) {
     const p = profile(t0 + k * 60000 * 5);
     const busDep = alignUp(t0 + 4 * 60000, p.headway * 60000, 2) + k * p.headway * 60000;
-    if (busDep - t0 > windowSec * 1000 + 4 * 60000) break;
+    if (busDep - t0 > horizonSec * 1000 + 4 * 60000) break;
     const walk1Start = busDep - 4 * 60000;
     const ride1 = Math.round((km * 0.55 / p.speed) * 3600000);
     const busArr = busDep + ride1;
@@ -91,11 +130,11 @@ function buildItineraries(vars) {
         numberOfTransfers: 1,
         legs: [
           leg({ mode: 'WALK', from: A, to: s1, start: walk1Start, end: busDep }),
-          leg({ mode: 'BUS', from: s1, to: sx, start: busDep, end: busArr, delay, headsign: 'Itäkeskus',
+          leg({ mode: 'BUS', from: s1, to: sx, start: busDep, end: busArr, delay, headsign: 'Itäkeskus', stops: between(s1, sx, busDep, busArr, '550'),
             route: { gtfsId: 'HSL:1550', shortName: '550', longName: 'Westendinasema - Itäkeskus', mode: 'BUS', color: '007AC9' },
             trip: { gtfsId: `HSL:1550_${busDep}`, directionId: '0', tripHeadsign: 'Itäkeskus', departureStoptime: { scheduledDeparture: secOfDay(busDep - 600000) } } }),
           leg({ mode: 'WALK', from: sx, to: sx2, start: busArr, end: busArr + walkX }),
-          leg({ mode: 'TRAM', from: sx2, to: s2, start: tramDep, end: tramArr, headsign: 'Arabia',
+          leg({ mode: 'TRAM', from: sx2, to: s2, start: tramDep, end: tramArr, headsign: 'Arabia', stops: between(sx2, s2, tramDep, tramArr, '4'),
             route: { gtfsId: 'HSL:1004', shortName: '4', longName: 'Katajanokka - Munkkiniemi', mode: 'TRAM', color: '00985F' },
             trip: { gtfsId: `HSL:1004_${tramDep}`, directionId: '1', tripHeadsign: 'Arabia', departureStoptime: { scheduledDeparture: secOfDay(tramDep - 900000) } } }),
           leg({ mode: 'WALK', from: s2, to: B, start: tramArr, end: tramArr + 3 * 60000 }),
@@ -109,7 +148,7 @@ function buildItineraries(vars) {
         numberOfTransfers: 0,
         legs: [
           leg({ mode: 'WALK', from: A, to: s1, start: dDep - 4 * 60000, end: dDep }),
-          leg({ mode: 'BUS', from: s1, to: s2, start: dDep, end: dArr, headsign: 'Kontula',
+          leg({ mode: 'BUS', from: s1, to: s2, start: dDep, end: dArr, headsign: 'Kontula', stops: between(s1, s2, dDep, dArr, '52'),
             route: { gtfsId: 'HSL:1052', shortName: '52', longName: 'Kuninkaantammi - Kontula', mode: 'BUS', color: '007AC9' },
             trip: { gtfsId: `HSL:1052_${dDep}`, directionId: '0', tripHeadsign: 'Kontula', departureStoptime: { scheduledDeparture: secOfDay(dDep - 300000) } } }),
           leg({ mode: 'WALK', from: s2, to: B, start: dArr, end: dArr + 3 * 60000 }),
@@ -118,9 +157,6 @@ function buildItineraries(vars) {
     }
   }
   return out
-    .filter((it) => Date.parse(it.legs[0].start.scheduledTime) >= t0 - 60000)
-    .sort((a, b) => Date.parse(a.legs[0].start.scheduledTime) - Date.parse(b.legs[0].start.scheduledTime))
-    .slice(0, first)
     .map((it) => ({
       ...it,
       start: it.legs[0].start.scheduledTime,
@@ -128,7 +164,91 @@ function buildItineraries(vars) {
       duration: 0,
       walkDistance: 600,
       waitingTime: 0,
-    }));
+    }))
+    .sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
+}
+
+const HOUR = 3600_000;
+const startOf = (it) => Date.parse(it.start);
+const endOf = (it) => Date.parse(it.end);
+
+/**
+ * planConnection with paging. Cursors look like "mock:<kind>:<ms>":
+ *   depFrom (start >= t), depBefore (start < t), arrBefore (end < t), arrAfter (end > t).
+ * As in OTP, with "arrive by" forward paging (after) goes to earlier arrivals.
+ */
+function plan(vars) {
+  const n = vars.first ?? vars.last ?? 6;
+  const cursor = /^mock:(\w+):(\d+)$/.exec(vars.after ?? vars.before ?? '');
+  const arriveBy = cursor ? cursor[1].startsWith('arr') : !!vars.dateTime?.latestArrival;
+  let list;
+  if (cursor) {
+    const [, kind, tStr] = cursor;
+    const t = +tStr;
+    if (kind === 'depFrom') list = generate(vars, t, 3 * 3600).filter((it) => startOf(it) >= t - 60000).slice(0, n);
+    else if (kind === 'depBefore') list = generate(vars, t - 2 * HOUR, 2 * 3600).filter((it) => startOf(it) < t).slice(-n);
+    else if (kind === 'arrBefore') list = generate(vars, t - 4 * HOUR, 4 * 3600).filter((it) => endOf(it) < t).slice(-n);
+    else list = generate(vars, t - 2 * HOUR, 4 * 3600).filter((it) => endOf(it) > t).slice(0, n);
+  } else if (arriveBy) {
+    const t = Date.parse(vars.dateTime.latestArrival);
+    list = generate(vars, t - 4 * HOUR, 4 * 3600).filter((it) => endOf(it) <= t).slice(-n);
+  } else {
+    const t0 = Date.parse(vars.dateTime?.earliestDeparture ?? new Date().toISOString());
+    const windowSec = vars.searchWindow ? parseDuration(vars.searchWindow) : 3600;
+    list = generate(vars, t0, windowSec).filter((it) => startOf(it) >= t0 - 60000).slice(0, n);
+  }
+  const pageInfo = { searchWindowUsed: 'PT1H', hasNextPage: true, hasPreviousPage: true, startCursor: null, endCursor: null };
+  if (list.length) {
+    const starts = list.map(startOf);
+    const ends = list.map(endOf);
+    if (arriveBy) {
+      pageInfo.endCursor = `mock:arrBefore:${Math.min(...ends)}`;
+      pageInfo.startCursor = `mock:arrAfter:${Math.max(...ends)}`;
+    } else {
+      pageInfo.endCursor = `mock:depFrom:${Math.max(...starts) + 60000}`;
+      pageInfo.startCursor = `mock:depBefore:${Math.min(...starts)}`;
+    }
+  }
+  return { searchDateTime: null, routingErrors: [], pageInfo, edges: list.map((node) => ({ cursor: 'x', node })) };
+}
+
+/** Walking-only routes for aliased w0, w1, ... (about 1.25 × the straight line, like real streets). */
+function walks(vars) {
+  const data = {};
+  for (let i = 0; vars[`o${i}`]; i++) {
+    const a = endpoint(vars[`o${i}`], null);
+    const b = endpoint(vars[`d${i}`], null);
+    if (!a || !b) { data[`w${i}`] = { edges: [] }; continue; }
+    const m = dist(a, b) * 1000 * 1.25;
+    const speed = vars.p?.street?.walk?.speed ?? 1.33;
+    const pts = [[a.lat, a.lon], [(a.lat + b.lat) / 2 + 0.001, (a.lon + b.lon) / 2 - 0.001], [b.lat, b.lon]];
+    data[`w${i}`] = { edges: [{ node: { duration: Math.round(m / speed), legs: [{ distance: m, duration: Math.round(m / speed), legGeometry: { points: encodePolyline(pts) } }] } }] };
+  }
+  return data;
+}
+
+/**
+ * Live stop times for a demo trip. The delay cycles every 45 s through on time, 2.5 and 5 min late,
+ * and 2 min early, so the trip screen's late/early handling can be tried.
+ */
+export function demoDelaySec(now = Date.now()) {
+  return [0, 150, 300, -120][Math.floor(now / 45000) % 4];
+}
+
+function tripTimes(id) {
+  const stops = TRIPS.get(id);
+  if (!stops) return { trip: null };
+  const d = demoDelaySec() * 1000;
+  return {
+    trip: {
+      stoptimesForDate: stops.map((x) => ({
+        stop: { gtfsId: x.stopId },
+        scheduledArrival: x.t / 1000, scheduledDeparture: x.t / 1000,
+        realtimeArrival: (x.t + d) / 1000, realtimeDeparture: (x.t + d) / 1000,
+        serviceDay: 0, realtime: true,
+      })),
+    },
+  };
 }
 
 function alignUp(t, step, offsetMin) {
@@ -164,15 +284,12 @@ export async function mockFetch(url, init = {}) {
   }
   if (u.includes('/routing/')) {
     const { query, variables } = JSON.parse(init.body);
-    if (query.includes('planConnection')) {
-      return json({ data: { planConnection: { searchDateTime: null, routingErrors: [], pageInfo: { searchWindowUsed: 'PT1H' }, edges: buildItineraries(variables).map((node) => ({ cursor: 'x', node })) } } });
-    }
+    if (query.includes('directOnly')) return json({ data: walks(variables) });
+    if (query.includes('planConnection')) return json({ data: { planConnection: plan(variables) } });
     if (query.includes('routes(')) {
       return json({ data: { routes: [{ gtfsId: `HSL:1${variables.name}`, shortName: variables.name }] } });
     }
-    if (query.includes('stoptimesForDate')) {
-      return json({ data: { trip: null } });
-    }
+    if (query.includes('stoptimesForDate')) return json({ data: tripTimes(variables.id) });
   }
   return json({ errors: [{ message: 'not mocked' }] }, 404);
 }
